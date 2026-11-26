@@ -34,17 +34,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Bila repo hanya berisi ZIP project (belum diekstrak, mis. upload lewat HP), ekstrak otomatis di runner.
+      - name: Ekstrak project dari ZIP bila perlu
+        run: |
+          if [ ! -f project.godot ]; then
+            z="$(ls -S ./*.zip 2>/dev/null | head -1)"
+            if [ -n "$z" ]; then
+              echo "project.godot tidak ada di root; mengekstrak $z"
+              unzip -q -o "$z" -x ".github/*" "__MACOSX/*"
+              # bila isi zip dibungkus satu folder, pindahkan ke root
+              if [ ! -f project.godot ]; then
+                d="$(dirname "$(find . -maxdepth 2 -name project.godot -not -path './.git/*' | head -1)" 2>/dev/null)"
+                if [ -n "$d" ] && [ "$d" != "." ]; then cp -a "$d"/. . ; fi
+              fi
+            fi
+          fi
+
+      - name: Periksa isi repo (project Godot harus ada di root)
+        run: |
+          echo "== isi root repo =="; ls -la
+          missing=0
+          for f in project.godot export_presets.cfg signing/fantasylife_debug.jks; do
+            if [ -e "$f" ]; then echo "ada : $f"; else echo "HILANG: $f"; missing=1; fi
+          done
+          if [ ! -e project.godot ] || [ ! -e export_presets.cfg ]; then
+            echo "::error::project.godot / export_presets.cfg tidak ada di root repo. Upload ISI zip project (bukan zip-nya) ke root repo, sejajar dengan folder .github. Jika project ada di subfolder, pindahkan isinya ke root."
+            find . -maxdepth 3 -name project.godot -not -path "./.git/*" | sed 's/^/project.godot ditemukan di: /'
+            exit 1
+          fi
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Pasang platform & build-tools Android
+      # Runner GitHub (ubuntu-22.04) SUDAH berisi Android SDK di $ANDROID_SDK_ROOT. Dulu memakai android-actions/setup-android,
+      # tetapi langkah itu gagal sendiri (sdkmanager exit 1). Sekarang pakai SDK bawaan dan hanya memasang yang kurang.
+      - name: Siapkan Android SDK (bawaan runner)
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34" "cmdline-tools;latest"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "== terpasang di runner =="
+          ls "$ANDROID_SDK_ROOT/build-tools" "$ANDROID_SDK_ROOT/platforms" "$ANDROID_SDK_ROOT/cmdline-tools" 2>&1 || true
+          SM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="$(ls "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)"
+          need=""
+          [ -d "$ANDROID_SDK_ROOT/build-tools/34.0.0" ] || need="$need build-tools;34.0.0"
+          [ -d "$ANDROID_SDK_ROOT/platforms/android-34" ] || need="$need platforms;android-34"
+          [ -d "$ANDROID_SDK_ROOT/platform-tools" ] || need="$need platform-tools"
+          if [ -n "$need" ]; then
+            echo "Memasang yang kurang:$need"
+            yes | "$SM" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null || true
+            "$SM" --sdk_root="$ANDROID_SDK_ROOT" $need
+          else
+            echo "Semua komponen sudah ada."
+          fi
 
       - uses: chickensoft-games/setup-godot@v2
         with:
@@ -57,9 +101,27 @@ jobs:
           mkdir -p "$HOME/.config/godot" build
           # Kunci TETAP dari repo (signing/fantasylife_debug.jks): semua build bertanda tangan sama, jadi APK baru bisa DITIMPA di atas
           # yang lama TANPA uninstall (data permainan tetap). Kunci baru tiap build = HP menolak update & ID perangkat berubah.
-          cp signing/fantasylife_debug.jks "$HOME/debug.keystore"
+          if [ -f signing/fantasylife_debug.jks ]; then
+            cp signing/fantasylife_debug.jks "$HOME/debug.keystore"
+          else
+            echo "::warning::signing/fantasylife_debug.jks tidak ada di repo. Membuat kunci SEMENTARA: APK ini tidak bisa menimpa APK lain (harus uninstall dulu, data hilang). Tambahkan file itu ke repo."
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore "$HOME/debug.keystore" \
+              -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999
+          fi
           keytool -list -v -keystore "$HOME/debug.keystore" -storepass android | grep -E "SHA1|SHA256" | sed 's/^/Sidik jari kunci: /'
-          cat > "$HOME/.config/godot/editor_settings-${GODOT_VERSION}.tres" <<EOT [gd_resource type="EditorSettings" format=3] [resource] export/android/android_sdk_path = "${ANDROID_SDK_ROOT:-$ANDROID_HOME}" export/android/java_sdk_path = "${JAVA_HOME}" export/android/debug_keystore = "$HOME/debug.keystore" export/android/debug_keystore_user = "androiddebugkey" export/android/debug_keystore_pass = "android" export/android/force_system_user = false export/android/shutdown_adb_on_exit = true EOT
+          # Ditulis dengan printf (BUKAN heredoc): heredoc rusak bila indentasi YAML berubah (mis. saat diedit di editor web/HP).
+          SETTINGS="$HOME/.config/godot/editor_settings-${GODOT_VERSION}.tres"
+          printf '%s\n' \
+            '[gd_resource type="EditorSettings" format=3]' \
+            '[resource]' \
+            "export/android/android_sdk_path = \"${ANDROID_SDK_ROOT:-$ANDROID_HOME}\"" \
+            "export/android/java_sdk_path = \"${JAVA_HOME}\"" \
+            "export/android/debug_keystore = \"$HOME/debug.keystore\"" \
+            'export/android/debug_keystore_user = "androiddebugkey"' \
+            'export/android/debug_keystore_pass = "android"' \
+            'export/android/force_system_user = false' \
+            'export/android/shutdown_adb_on_exit = true' > "$SETTINGS"
+          cat "$SETTINGS"
           cp "$HOME/.config/godot/editor_settings-${GODOT_VERSION}.tres" "$HOME/.config/godot/editor_settings-4.tres"
 
       - name: Nomor versi dari nomor run
